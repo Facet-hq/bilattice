@@ -1,11 +1,14 @@
-use crate::{encrypt_1_to_1,decrypt_1_to_1,generate_keypair};
+use anyhow::Result;
+use bilattice::{decrypt_1_to_1, encrypt_1_to_1, generate_keypair};
 
+#[test]
+fn encrypt_decrypt_1_to_1_roundtrip() -> Result<()> {
+    let (enc_bob, _sig_bob) = generate_keypair()?;
+    let plaintext = b"elenasigmalera";
 
-fn main() -> Result<()> {
-    let (enc_alice, sig_alice) = generate_keypair()?;
-    let (enc_bob, sig_bob) = generate_keypair()?;
+    let encrypted = encrypt_1_to_1(plaintext.to_vec(), &enc_bob.kp_pub)?;
+    let decrypted = decrypt_1_to_1(encrypted, &enc_bob)?;
 
-    assert_eq!(decript_1_to_1(encrypt_1_to_1(b"elenasigmalera",&enc_bob.kp_pub)));
-    
+    assert_eq!(decrypted, plaintext);
     Ok(())
 }

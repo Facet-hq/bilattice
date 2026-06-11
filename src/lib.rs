@@ -238,34 +238,78 @@ pub fn encrypt_1_to_1(
     })
 }
 
-pub fn decript_1_to_1(
+pub fn decrypt_1_to_1(
     encrypted_content: EncryptedMessage,
-    recipient: &EncryptionKeypairSecret,
+    recipient: &EncryptionKeypair,
 ) -> Result<Vec<u8>> {
     oqs::init();
+    if encrypted_content.version != ENCRYPTED_MESSAGE_VERSION {
+        anyhow::bail!(
+            "unsupported encrypted message version: {}",
+            encrypted_content.version
+        );
+    }
+
     let salt = b"Facet's bilattice v1 lib";
     let direction = b"1to1 message sender->recipient";
     let mut ikm = Zeroizing::new([0u8; 64]);
 
-    let kyber_ss = kem::Kem::new(KEM_ALGORITHM)?
-        .decapsulate(&recipient.kyber, &encrypted_content.ml_kem_ciphertext)?;
+    let kyber_ss = kem::Kem::new(KEM_ALGORITHM)?.decapsulate(
+        &recipient.kp_sec.kyber,
+        &encrypted_content.ml_kem_ciphertext,
+    )?;
     let x25519_ss = recipient
+        .kp_sec
         .x25519
         .diffie_hellman(&encrypted_content.x25519_ephemeral_pub);
 
-
     ikm[..32].copy_from_slice(x25519_ss.as_bytes());
     ikm[32..].copy_from_slice(kyber_ss.as_ref());
+
+    let transcript_hash = {
+        let mut h = Sha3_256::new();
+
+        h.update(b"facet-bilattice-v1 transcript");
+        h.update(b"alg:x25519+ml-kem+hkdf-sha3-256+chacha20poly1305");
+
+        h.update(b"x25519_ephemeral_pub");
+        h.update(encrypted_content.x25519_ephemeral_pub.as_bytes());
+
+        h.update(b"recipient_x25519_pub");
+        h.update(recipient.kp_pub.x25519.as_bytes());
+
+        h.update(b"recipient_kyber_pub");
+        h.update(recipient.kp_pub.kyber.as_ref());
+
+        h.update(b"kyber_ciphertext");
+        h.update(encrypted_content.ml_kem_ciphertext.as_ref());
+
+        let out: [u8; 32] = h.finalize().into();
+        out
+    };
+
     let hk = Hkdf::<Sha3_256>::new(Some(salt), &ikm[..]);
 
+    let mut info = Vec::new();
+    info.extend_from_slice(b"chacha20poly1305 key");
+    info.extend_from_slice(b"\0");
+    info.extend_from_slice(&transcript_hash);
+    info.extend_from_slice(b"\0");
+    info.extend_from_slice(direction);
+
     let mut out = Zeroizing::new([0u8; 44]);
+    hk.expand(&info, &mut out[..])
+        .map_err(|err| anyhow::anyhow!("HKDF-SHA3 expand failed: {}", err))?;
     let key = &out[..32];
+    let nonce_bytes = &out[32..44];
+    if encrypted_content.poly1305_nonce.as_slice() != nonce_bytes {
+        anyhow::bail!("encrypted message nonce does not match derived nonce");
+    }
+
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
     Ok(cipher
-        .decrypt(
-            Nonce::from_slice(&encrypted_content.poly1305_nonce),
-            encrypted_content.ciphertext.as_slice(),
-        )
-        .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 encryption failed"))?)
+        .decrypt(nonce, encrypted_content.ciphertext.as_slice())
+        .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 decryption failed"))?)
 }
