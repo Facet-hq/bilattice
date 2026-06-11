@@ -70,8 +70,9 @@ pub struct SignedContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedMessage {
     pub version: u8,
-    pub x25519_ephemeral_pub: [u8; 32],
-    pub ml_kem_ciphertext: Vec<u8>,
+    pub x25519_ephemeral_pub: x25519_dalek::PublicKey,
+    poly1305_nonce: Vec<u8>,
+    pub ml_kem_ciphertext: kem::Ciphertext,
     pub ciphertext: Vec<u8>,
 }
 
@@ -167,7 +168,7 @@ pub fn verify(
 
 pub fn encrypt_1_to_1(
     content: Vec<u8>,
-    recipient: EncryptionKeypairPublic,
+    recipient: &EncryptionKeypairPublic,
 ) -> Result<EncryptedMessage> {
     oqs::init();
     let salt = b"Facet's bilattice v1 lib";
@@ -225,13 +226,46 @@ pub fn encrypt_1_to_1(
         .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, content.as_ref())
+        .encrypt(&nonce, content.as_ref())
         .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 encryption failed"))?;
 
     Ok(EncryptedMessage {
         version: ENCRYPTED_MESSAGE_VERSION,
-        x25519_ephemeral_pub: x25519_ephemeral_pub.to_bytes(),
-        ml_kem_ciphertext: kyber_ct.into_vec(),
+        x25519_ephemeral_pub: x25519_ephemeral_pub,
+        ml_kem_ciphertext: kyber_ct,
+        poly1305_nonce: nonce.to_vec(),
         ciphertext,
     })
+}
+
+pub fn decript_1_to_1(
+    encrypted_content: EncryptedMessage,
+    recipient: &EncryptionKeypairSecret,
+) -> Result<Vec<u8>> {
+    oqs::init();
+    let salt = b"Facet's bilattice v1 lib";
+    let direction = b"1to1 message sender->recipient";
+    let mut ikm = Zeroizing::new([0u8; 64]);
+
+    let kyber_ss = kem::Kem::new(KEM_ALGORITHM)?
+        .decapsulate(&recipient.kyber, &encrypted_content.ml_kem_ciphertext)?;
+    let x25519_ss = recipient
+        .x25519
+        .diffie_hellman(&encrypted_content.x25519_ephemeral_pub);
+
+
+    ikm[..32].copy_from_slice(x25519_ss.as_bytes());
+    ikm[32..].copy_from_slice(kyber_ss.as_ref());
+    let hk = Hkdf::<Sha3_256>::new(Some(salt), &ikm[..]);
+
+    let mut out = Zeroizing::new([0u8; 44]);
+    let key = &out[..32];
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))?;
+    Ok(cipher
+        .decrypt(
+            Nonce::from_slice(&encrypted_content.poly1305_nonce),
+            encrypted_content.ciphertext.as_slice(),
+        )
+        .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 encryption failed"))?)
 }
