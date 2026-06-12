@@ -1,7 +1,7 @@
 //! # bilattice
 //!
-//! Hybrid post-quantum cryptographic primitives for a 1-to-1 secure messaging
-//! app. Every operation runs a classical and a post-quantum algorithm side by
+//! Hybrid post-quantum cryptographic primitives for native secure messaging
+//! apps. Every operation runs a classical and a post-quantum algorithm side by
 //! side, so a break in one leaves the other standing.
 //!
 //! - `bi` — two algorithms per operation (classical + post-quantum).
@@ -16,7 +16,8 @@
 //!
 //! ## What this crate gives you (and what it doesn't)
 //!
-//! bilattice is a thin primitive layer. It hands you four building blocks:
+//! bilattice is a thin primitive layer. It hands you a small set of building
+//! blocks:
 //!
 //! - [`generate_keypair`] — one identity = one encryption keypair + one signing
 //!   keypair.
@@ -561,12 +562,12 @@ pub fn encrypt_1_to_1(
     let cipher = chacha20poly1305_from_key(key)?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(&nonce, content.as_ref())
+        .encrypt(nonce, content.as_ref())
         .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 encryption failed"))?;
 
     Ok(EncryptedMessage {
         version: ENCRYPTED_MESSAGE_VERSION,
-        x25519_ephemeral_pub: x25519_ephemeral_pub,
+        x25519_ephemeral_pub,
         ml_kem_ciphertext: kyber_ct,
         ciphertext,
     })
@@ -631,7 +632,7 @@ pub fn decrypt_1_to_1(
 
     let cipher = chacha20poly1305_from_key(key)?;
     let nonce = Nonce::from_slice(nonce_bytes);
-    Ok(cipher
+    cipher
         .decrypt(nonce, encrypted_content.ciphertext.as_slice())
-        .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 decryption failed"))?)
+        .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 decryption failed"))
 }

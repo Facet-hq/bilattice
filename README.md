@@ -1,6 +1,6 @@
 # bilattice
 
-Hybrid post-quantum cryptographic primitives for a 1-to-1 secure messaging app.
+Hybrid post-quantum cryptographic primitives for native secure messaging apps.
 Every operation runs a classical **and** a post-quantum algorithm side by side,
 so a break in one still leaves the other standing.
 
@@ -19,7 +19,7 @@ so a break in one still leaves the other standing.
 
 ## Scope
 
-bilattice gives you four building blocks and nothing more:
+bilattice gives you these building blocks and nothing more:
 
 | Function | Purpose |
 |----------|---------|
