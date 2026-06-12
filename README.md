@@ -104,20 +104,28 @@ detail via `LayerErrors`.
 
 ### Putting it together
 
-```
-sender                                            recipient
-  plaintext
-    │  sign(.., sig_sec)
-    ▼
-  SignedContent  ──serialize──┐
-                              │ encrypt_1_to_1(.., recipient_enc_pub)
-                              ▼
-                        EncryptedMessage ──► server (relays, never decrypts)
-                                                   │
-                              decrypt_1_to_1(.., my_enc_keypair)
-                                                   ▼
-                                            SignedContent
-                              verify(.., sender_sig_pub) ──► plaintext (trusted)
+```mermaid
+flowchart TB
+    subgraph sender["Sender"]
+        direction TB
+        P["plaintext"]
+        S["SignedContent"]
+        E["EncryptedMessage"]
+        P -->|"sign(.., sig_sec)"| S
+        S -->|"serialize + encrypt_1_to_1(.., recipient_enc_pub)"| E
+    end
+
+    SRV{{"Server<br/>(relays, never decrypts)"}}
+
+    subgraph recipient["Recipient"]
+        direction TB
+        S2["SignedContent"]
+        PT["plaintext (trusted)"]
+        S2 -->|"verify(.., sender_sig_pub)"| PT
+    end
+
+    E -->|"EncryptedMessage"| SRV
+    SRV -->|"decrypt_1_to_1(.., my_enc_keypair)"| S2
 ```
 
 ## Wire format & versioning
