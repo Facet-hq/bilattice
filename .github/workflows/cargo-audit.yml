@@ -26,11 +26,33 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-audit
+          cache-on-failure: true
+
+      - name: Cache RustSec advisory database
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: ${{ runner.os }}-rustsec-advisory-db-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-rustsec-advisory-db-
+
+      - name: Cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-v1
+
       - name: Generate lockfile
         run: cargo generate-lockfile
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo audit --version || cargo install cargo-audit --locked
 
       - name: Run cargo audit
         run: cargo audit --deny warnings

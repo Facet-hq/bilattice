@@ -24,10 +24,30 @@ jobs:
           rustup update stable
           rustup component add clippy llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sonarcloud
+          cache-on-failure: true
+
+      - name: Cache cargo-llvm-cov binary
+        id: cache-cargo-llvm-cov
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-llvm-cov-v1
 
       - name: Install cargo-llvm-cov
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonarqube-cache-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-sonarqube-cache-
 
       - name: Generate coverage report
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
