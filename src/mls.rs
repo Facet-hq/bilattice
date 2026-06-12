@@ -1,8 +1,37 @@
-//! MLS transport helpers for Facet.
+//! MLS group-transport helpers for Facet.
 //!
 //! This module keeps OpenMLS responsible for group state and transport
 //! encryption, while bilattice remains responsible for hybrid content
 //! signatures. The application payload is always a serialized [`SignedContent`].
+//!
+//! ## Security model
+//!
+//! MLS gives group membership, epoch state, forward-secret group encryption, and
+//! authenticated delivery of MLS protocol messages. bilattice then wraps the
+//! application plaintext in [`crate::sign`] before handing it to MLS, so received
+//! application messages must satisfy both layers:
+//!
+//! - OpenMLS accepts the protocol message for the local group state.
+//! - [`crate::verify`] accepts the embedded hybrid Ed25519 + ML-DSA-65 content
+//!   signature.
+//!
+//! Those two signatures serve different domains. The OpenMLS signer below uses
+//! Ed25519 exactly as required by the selected MLS ciphersuite; bilattice content
+//! signatures are produced separately by [`crate::sign`], with their own content
+//! domain separation and ML-DSA context string.
+//!
+//! ## Known limitations
+//!
+//! The X-Wing ciphersuite used here is hybrid for MLS HPKE transport, but MLS
+//! protocol authentication is still Ed25519 because current OpenMLS ciphersuites
+//! do not provide a standard hybrid signature scheme. That means group operations
+//! such as commits and adds are not post-quantum authenticated at the MLS layer.
+//! The hybrid [`SignedContent`] payload compensates for application-message
+//! authorship, not for MLS membership authentication.
+//!
+//! This module also does not implement a Delivery Service, federation, durable
+//! group-state storage, membership policy, or metadata-hiding features. It only
+//! provides client-side helpers for producing and consuming opaque MLS bytes.
 
 use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::ed25519::signature::Signer as _;
@@ -44,6 +73,9 @@ pub struct AddMemberMessages {
 
 impl MlsSigner for SignKeypairSecret {
     fn sign(&self, payload: &[u8]) -> std::result::Result<Vec<u8>, SignerError> {
+        // OpenMLS constructs the MLS protocol TBS payload and its own signature
+        // domain. Do not route this through crate::sign, which is for bilattice
+        // application content and also emits an ML-DSA signature.
         Ok(self.ed25519.sign(payload).to_bytes().to_vec())
     }
 

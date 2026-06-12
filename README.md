@@ -158,10 +158,10 @@ flowchart TB
 key, the ML-KEM ciphertext, the sealed payload, and a `version` byte. The AEAD
 nonce is **derived** (from a transcript hash binding the ephemeral key, the
 recipient's keys and the ML-KEM ciphertext), not random — so it isn't a public
-field, and `decrypt_1_to_1` re-derives and cross-checks it.
+field, and `decrypt_1_to_1` re-derives it.
 
 `decrypt_1_to_1` rejects any message whose `version` ≠ `ENCRYPTED_MESSAGE_VERSION`
-(currently `1`), so the format can evolve without old and new clients silently
+(currently `2`), so the format can evolve without old and new clients silently
 misreading each other.
 
 ## Design notes
@@ -208,7 +208,17 @@ vetted combiner if you reuse this crate for anything real.
 
 Hybrid: ML-DSA-65 (NIST FIPS 204) + Ed25519, signed in parallel. `verify`
 requires **both** to pass (AND, not OR), and the Ed25519 side uses
-`verify_strict` to reject malleable / non-canonical signatures.
+`verify_strict` to reject malleable / non-canonical signatures. Content
+signatures are domain-separated: Ed25519 signs a bilattice-prefixed message, and
+ML-DSA-65 uses a non-empty FIPS 204 context string. A signature produced by
+`sign` is therefore not a valid signature over the raw content bytes in another
+protocol.
+
+This layer deliberately produces transferable authorship proofs. That is useful
+for some app designs, but it is not Signal-style deniability: a receiver can
+show a valid `SignedContent` to someone else. To prevent surreptitious
+forwarding, the application payload passed to `sign` should include the intended
+recipient, conversation, or transcript context when that distinction matters.
 
 ### MLS group transport
 
@@ -217,7 +227,9 @@ with X-Wing `0x004D`: ML-KEM-768 + X25519 for HPKE, ChaCha20-Poly1305 for AEAD,
 HKDF-SHA256, and Ed25519 for the mandatory MLS protocol signatures. `0x004D` is
 still a draft ciphersuite code point, so a future OpenMLS/IETF update could
 require a wire-format migration. bilattice's hybrid `SignedContent` sits inside
-the encrypted MLS application message.
+the encrypted MLS application message. MLS membership operations themselves are
+authenticated by Ed25519 because current OpenMLS ciphersuites do not provide a
+standard hybrid signature scheme.
 
 The ratchet tree extension is enabled in the default group config so Welcome
 messages are self-contained for the client. The Delivery Service still does not

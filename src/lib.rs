@@ -104,7 +104,7 @@ const KEM_ALGORITHM: kem::Algorithm = kem::Algorithm::MlKem768;
 /// [`decrypt_1_to_1`] refuses any message whose `version` differs, so bumping
 /// this constant is how the on-the-wire format evolves without old and new
 /// clients silently misreading each other.
-pub const ENCRYPTED_MESSAGE_VERSION: u8 = 1;
+pub const ENCRYPTED_MESSAGE_VERSION: u8 = 2;
 
 /// Number of bytes in a public-key fingerprint.
 pub const KEY_FINGERPRINT_LEN: usize = 32;
@@ -115,6 +115,8 @@ pub type KeyFingerprint = [u8; KEY_FINGERPRINT_LEN];
 const HKDF_SALT: &[u8] = b"Facet's bilattice v1 lib";
 const MESSAGE_DIRECTION: &[u8] = b"1to1 message sender->recipient";
 const AEAD_INFO_LABEL: &[u8] = b"chacha20poly1305 key";
+const ED25519_CONTENT_SIGNATURE_DOMAIN: &[u8] = b"facet-bilattice-v1 ed25519 content signature";
+const ML_DSA_CONTENT_SIGNATURE_CONTEXT: &[u8] = b"facet-bilattice-v1 ml-dsa-65 content";
 const AEAD_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const KDF_OUTPUT_LEN: usize = AEAD_KEY_LEN + AEAD_NONCE_LEN;
@@ -252,7 +254,6 @@ pub struct SignedContent {
 pub struct EncryptedMessage {
     pub version: u8,
     pub x25519_ephemeral_pub: x25519_dalek::PublicKey,
-    poly1305_nonce: Vec<u8>,
     pub ml_kem_ciphertext: kem::Ciphertext,
     pub ciphertext: Vec<u8>,
 }
@@ -333,6 +334,16 @@ fn chacha20poly1305_from_key(key: &[u8]) -> Result<ChaCha20Poly1305> {
         .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))
 }
 
+fn ed25519_content_signature_message(content: &[u8]) -> Vec<u8> {
+    let mut msg =
+        Vec::with_capacity(ED25519_CONTENT_SIGNATURE_DOMAIN.len() + 1 + 8 + content.len());
+    msg.extend_from_slice(ED25519_CONTENT_SIGNATURE_DOMAIN);
+    msg.push(0);
+    msg.extend_from_slice(&(content.len() as u64).to_be_bytes());
+    msg.extend_from_slice(content);
+    msg
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -410,9 +421,10 @@ pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
 /// Sign `content` with both halves of the sender's signing key.
 ///
 /// Produces a [`SignedContent`] holding the original bytes plus an Ed25519 and
-/// an ML-DSA-65 signature over them. Use this to prove *who* sent a message;
-/// pair it with [`verify`] on the receiving side. For a messaging app, the usual
-/// flow is sign-then-encrypt: sign the plaintext, serialize the
+/// an ML-DSA-65 signature over a domain-separated bilattice content-signature
+/// context. Use this to prove *who* sent a message; pair it with [`verify`] on
+/// the receiving side. For a messaging app, the usual flow is sign-then-encrypt:
+/// sign the plaintext, serialize the
 /// [`SignedContent`], then [`encrypt_1_to_1`] the result so the signature stays
 /// hidden from the transport server.
 ///
@@ -421,11 +433,16 @@ pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
 /// signature.
 pub fn sign(content: Vec<u8>, sender: &SignKeypairSecret) -> Result<SignedContent> {
     oqs::init();
-    let array_content = &content.clone();
+    let ed25519_message = ed25519_content_signature_message(&content);
+    let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
     Ok(SignedContent {
+        dilithium_sign: sig_alg.sign_with_ctx_str(
+            &content,
+            ML_DSA_CONTENT_SIGNATURE_CONTEXT,
+            &sender.dilithium,
+        )?,
+        ed25519_sign: sender.ed25519.sign(&ed25519_message),
         content,
-        dilithium_sign: { sig::Sig::new(DSA_ALGORITHM)?.sign(array_content, &sender.dilithium)? },
-        ed25519_sign: { sender.ed25519.sign(array_content) },
     })
 }
 
@@ -462,9 +479,10 @@ pub fn verify(
     oqs::init();
     let dilithium_err = match sig::Sig::new(DSA_ALGORITHM) {
         Ok(sig_alg) => sig_alg
-            .verify(
+            .verify_with_ctx_str(
                 &sigcontent.content,
                 &sigcontent.dilithium_sign,
+                ML_DSA_CONTENT_SIGNATURE_CONTEXT,
                 &sender.dilithium,
             )
             .err()
@@ -472,9 +490,10 @@ pub fn verify(
         Err(err) => Some(err.to_string()),
     };
 
+    let ed25519_message = ed25519_content_signature_message(&sigcontent.content);
     let ed25519_err = sender
         .ed25519
-        .verify_strict(&sigcontent.content, &sigcontent.ed25519_sign)
+        .verify_strict(&ed25519_message, &sigcontent.ed25519_sign)
         .err()
         .map(|e| e.to_string());
 
@@ -549,7 +568,6 @@ pub fn encrypt_1_to_1(
         version: ENCRYPTED_MESSAGE_VERSION,
         x25519_ephemeral_pub: x25519_ephemeral_pub,
         ml_kem_ciphertext: kyber_ct,
-        poly1305_nonce: nonce.to_vec(),
         ciphertext,
     })
 }
@@ -564,8 +582,7 @@ pub fn encrypt_1_to_1(
 /// re-derives the AEAD key and nonce and decrypts.
 ///
 /// As defense in depth, it first rejects messages whose `version` differs from
-/// [`ENCRYPTED_MESSAGE_VERSION`], and verifies that the stored nonce matches the
-/// one freshly derived from the transcript before attempting decryption.
+/// [`ENCRYPTED_MESSAGE_VERSION`].
 ///
 /// ```no_run
 /// # use bilattice::{generate_keypair, encrypt_1_to_1, decrypt_1_to_1};
@@ -578,9 +595,9 @@ pub fn encrypt_1_to_1(
 /// ```
 ///
 /// # Errors
-/// Returns an error if the version is unsupported, the derived nonce doesn't
-/// match, ML-KEM decapsulation fails, or AEAD authentication/decryption fails
-/// (e.g. the message was tampered with or sealed for a different recipient).
+/// Returns an error if the version is unsupported, ML-KEM decapsulation fails,
+/// or AEAD authentication/decryption fails (e.g. the message was tampered with
+/// or sealed for a different recipient).
 pub fn decrypt_1_to_1(
     encrypted_content: EncryptedMessage,
     recipient: &EncryptionKeypair,
@@ -611,9 +628,6 @@ pub fn decrypt_1_to_1(
     let out = derive_aead_key_material(&ikm[..], &transcript_hash)?;
     let key = &out[..AEAD_KEY_LEN];
     let nonce_bytes = &out[AEAD_KEY_LEN..];
-    if encrypted_content.poly1305_nonce.as_slice() != nonce_bytes {
-        anyhow::bail!("encrypted message nonce does not match derived nonce");
-    }
 
     let cipher = chacha20poly1305_from_key(key)?;
     let nonce = Nonce::from_slice(nonce_bytes);
