@@ -13,8 +13,9 @@ so a break in one still leaves the other standing.
 | Signature     | Ed25519   | ML-DSA-65    | both must verify (AND) |
 
 > This crate is a standalone primitive layer. It is **not** `facet-core`, and it
-> is not tied to Facet — it could back any messaging app. Sessions, group state
-> and federation live above this crate.
+> is not tied to Facet — it could back any messaging app. The optional `mls`
+> feature adds the first OpenMLS group-transport helpers; federation still lives
+> above this crate.
 
 ## Scope
 
@@ -26,18 +27,20 @@ bilattice gives you these building blocks and nothing more:
 | `encrypt_1_to_1()`     | seal a message for one recipient |
 | `decrypt_1_to_1()`     | open a sealed message |
 | `sign()` / `verify()`  | prove / check who authored a blob |
+| `mls` feature          | wrap `SignedContent` in OpenMLS application messages |
 
 It deliberately does **not** provide:
 
 - **Sessions or ratcheting.** Each `encrypt_1_to_1` is an independent sealed
   envelope (fresh ephemeral X25519 key + fresh ML-KEM encapsulation per
-  message). Session and group state belong above this primitive crate.
+  message). Group session state is delegated to OpenMLS behind the optional
+  `mls` feature.
 - **Automatic sender authentication.** Encryption and signing are separate
   operations on separate keys. Encrypting does not sign. See
   [Putting it together](#putting-it-together).
 - **Delivery Service or federation.** The server still only stores and relays
-  opaque bytes. Group membership policy, queues and federation belong above
-  this primitive crate.
+  opaque bytes. Group membership policy, queues, federation and durable MLS
+  state belong above this primitive crate.
 
 ## Integration in a messaging app
 
@@ -97,6 +100,31 @@ match verify(&signed, &sender_sig_pub) {
 
 `verify` requires **both** signatures to pass; a failure reports per-algorithm
 detail via `LayerErrors`.
+
+### 4. Group messages — sign then MLS encrypt
+
+With `--features mls`, group transport uses OpenMLS with the libcrux provider
+and the X-Wing ciphersuite `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519`
+(`0x004D`). Application messages remain bilattice payloads:
+
+```rust,no_run
+use bilattice::mls;
+
+let outbound = mls::create_signed_application_message(
+    &mut group,
+    &provider,
+    &signing.kp_sec, // MLS Ed25519 protocol signature
+    &signing.kp_sec, // bilattice Ed25519 + ML-DSA content signature
+    plaintext,
+)?;
+
+let bytes = mls::serialize_message(&outbound)?;
+// relay `bytes` through the Delivery Service unchanged.
+```
+
+On receive, `mls::process_signed_application_message` decrypts via MLS,
+deserializes `SignedContent` with `postcard`, and then calls `verify`, so both
+Ed25519 and ML-DSA-65 must pass before the plaintext is trusted.
 
 ### Putting it together
 
@@ -192,6 +220,21 @@ show a valid `SignedContent` to someone else. To prevent surreptitious
 forwarding, the application payload passed to `sign` should include the intended
 recipient, conversation, or transcript context when that distinction matters.
 
+### MLS group transport
+
+The optional `mls` feature fixes Facet's group transport to OpenMLS + libcrux
+with X-Wing `0x004D`: ML-KEM-768 + X25519 for HPKE, ChaCha20-Poly1305 for AEAD,
+HKDF-SHA256, and Ed25519 for the mandatory MLS protocol signatures. `0x004D` is
+still a draft ciphersuite code point, so a future OpenMLS/IETF update could
+require a wire-format migration. bilattice's hybrid `SignedContent` sits inside
+the encrypted MLS application message. MLS membership operations themselves are
+authenticated by Ed25519 because current OpenMLS ciphersuites do not provide a
+standard hybrid signature scheme.
+
+The ratchet tree extension is enabled in the default group config so Welcome
+messages are self-contained for the client. The Delivery Service still does not
+decrypt or inspect them.
+
 ## Status
 
 | Function          | State |
@@ -201,6 +244,8 @@ recipient, conversation, or transcript context when that distinction matters.
 | `decrypt_1_to_1`  | V |
 | `sign`            | V |
 | `verify`          | V |
+| MLS group transport | V initial helper API behind `--features mls` |
 
 Run `cargo doc -p bilattice --open` for the full API reference, or
-`cargo test -p bilattice` for primitive tests.
+`cargo test -p bilattice` for primitive tests. Run
+`cargo test -p bilattice --features mls` for the OpenMLS round-trip test.
