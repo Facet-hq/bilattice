@@ -30,14 +30,12 @@
 //! - **1-to-1 sessions / ratcheting.** Every [`encrypt_1_to_1`] call is a fresh,
 //!   independent "sealed envelope": a new ephemeral X25519 key and a new ML-KEM
 //!   encapsulation per message. There is no forward-secret session state here.
-//!   Group session state belongs to the optional `mls` feature, which wraps
-//!   OpenMLS.
+//!   Group/session protocols belong to the layer above this crate.
 //! - **Identity binding.** Encryption and signing are separate operations on
 //!   separate keys (see below). bilattice never automatically signs what it
 //!   encrypts. Your app decides how to combine them.
-//! - **A Delivery Service / federation.** With the `mls` feature, bilattice can
-//!   create and process OpenMLS application messages carrying [`SignedContent`].
-//!   The server side still just stores and relays opaque MLS bytes.
+//! - **A Delivery Service / federation.** The server side should just store and
+//!   relay opaque bytes; queues, policy and federation belong above this crate.
 //!
 //! ## Combining encryption and signatures
 //!
@@ -93,9 +91,6 @@ use x25519_dalek::{
     EphemeralSecret as X25519EphSec, PublicKey as X25519Pub, StaticSecret as X25519Sec,
 };
 use zeroize::Zeroizing;
-
-#[cfg(feature = "mls")]
-pub mod mls;
 
 const DSA_ALGORITHM: sig::Algorithm = sig::Algorithm::MlDsa65;
 const KEM_ALGORITHM: kem::Algorithm = kem::Algorithm::MlKem768;
