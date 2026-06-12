@@ -163,7 +163,7 @@ impl EncryptionKeypairPublic {
 /// serialize to the server, or transmit.
 #[derive(Serialize, Deserialize)]
 pub struct EncryptionKeypairSecret {
-    pub kyber: KyberSec,
+    pub kyber: MlKemSecretKey,
     pub x25519: X25519Sec,
 }
 
@@ -211,8 +211,62 @@ impl SignKeypairPublic {
 /// Required to [`sign`]. Treat as highly sensitive.
 #[derive(Serialize, Deserialize)]
 pub struct SignKeypairSecret {
-    pub dilithium: DilithiumSec,
+    pub dilithium: MlDsaSecretKey,
     pub ed25519: Ed25519Sec,
+}
+
+/// Owned ML-KEM-768 secret key bytes, zeroized on drop.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MlKemSecretKey(Zeroizing<Vec<u8>>);
+
+impl MlKemSecretKey {
+    fn from_oqs(secret_key: KyberSec) -> Self {
+        Self(Zeroizing::new(secret_key.into_vec()))
+    }
+
+    fn as_oqs_ref<'a>(&'a self, kem_alg: &kem::Kem) -> Result<kem::SecretKeyRef<'a>> {
+        kem_alg
+            .secret_key_from_bytes(self.0.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM secret key length"))
+    }
+
+    /// Return the raw secret key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for MlKemSecretKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Owned ML-DSA-65 secret key bytes, zeroized on drop.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MlDsaSecretKey(Zeroizing<Vec<u8>>);
+
+impl MlDsaSecretKey {
+    fn from_oqs(secret_key: DilithiumSec) -> Self {
+        Self(Zeroizing::new(secret_key.into_vec()))
+    }
+
+    fn as_oqs_ref<'a>(&'a self, sig_alg: &sig::Sig) -> Result<sig::SecretKeyRef<'a>> {
+        sig_alg
+            .secret_key_from_bytes(self.0.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA secret key length"))
+    }
+
+    /// Return the raw secret key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for MlDsaSecretKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
 }
 
 // ---
@@ -397,7 +451,7 @@ pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
                 x25519: x25519_public,
             },
             kp_sec: EncryptionKeypairSecret {
-                kyber: kyber_secret,
+                kyber: MlKemSecretKey::from_oqs(kyber_secret),
                 x25519,
             },
         },
@@ -407,7 +461,7 @@ pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
                 ed25519: ed25519_public,
             },
             kp_sec: SignKeypairSecret {
-                dilithium: dilithium_secret,
+                dilithium: MlDsaSecretKey::from_oqs(dilithium_secret),
                 ed25519,
             },
         },
@@ -431,11 +485,12 @@ pub fn sign(content: Vec<u8>, sender: &SignKeypairSecret) -> Result<SignedConten
     oqs::init();
     let ed25519_message = ed25519_content_signature_message(&content);
     let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
+    let dilithium = sender.dilithium.as_oqs_ref(&sig_alg)?;
     Ok(SignedContent {
         dilithium_sign: sig_alg.sign_with_ctx_str(
             &content,
             ML_DSA_CONTENT_SIGNATURE_CONTEXT,
-            &sender.dilithium,
+            dilithium,
         )?,
         ed25519_sign: sender.ed25519.sign(&ed25519_message),
         content,
@@ -545,11 +600,12 @@ pub fn encrypt_1_to_1(
     let (kyber_ct, kyber_ss) = kem::Kem::new(KEM_ALGORITHM)?
         .encapsulate(&recipient.kyber)
         .map_err(|e| anyhow::anyhow!("Failed to encapsulate with public key: {}", e))?;
+    let kyber_ss = Zeroizing::new(kyber_ss.into_vec());
     let x25519_ephemeral = X25519EphSec::random();
     let x25519_ephemeral_pub = X25519Pub::from(&x25519_ephemeral);
     let x25519_ss = x25519_ephemeral.diffie_hellman(&recipient.x25519);
 
-    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_ref())?;
+    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_slice())?;
     let transcript_hash = transcript_hash(&x25519_ephemeral_pub, recipient, kyber_ct.as_ref());
     let out = derive_aead_key_material(&ikm[..], &transcript_hash)?;
     let key = &out[..AEAD_KEY_LEN];
@@ -606,16 +662,16 @@ pub fn decrypt_1_to_1(
         );
     }
 
-    let kyber_ss = kem::Kem::new(KEM_ALGORITHM)?.decapsulate(
-        &recipient.kp_sec.kyber,
-        &encrypted_content.ml_kem_ciphertext,
-    )?;
+    let kem_alg = kem::Kem::new(KEM_ALGORITHM)?;
+    let kyber = recipient.kp_sec.kyber.as_oqs_ref(&kem_alg)?;
+    let kyber_ss = kem_alg.decapsulate(kyber, &encrypted_content.ml_kem_ciphertext)?;
+    let kyber_ss = Zeroizing::new(kyber_ss.into_vec());
     let x25519_ss = recipient
         .kp_sec
         .x25519
         .diffie_hellman(&encrypted_content.x25519_ephemeral_pub);
 
-    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_ref())?;
+    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_slice())?;
     let transcript_hash = transcript_hash(
         &encrypted_content.x25519_ephemeral_pub,
         &recipient.kp_pub,
