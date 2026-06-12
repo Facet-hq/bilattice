@@ -1,3 +1,79 @@
+//! # bilattice
+//!
+//! Hybrid post-quantum cryptographic primitives for a 1-to-1 secure messaging
+//! app. Every operation runs a classical and a post-quantum algorithm side by
+//! side, so a break in one leaves the other standing.
+//!
+//! - `bi` — two algorithms per operation (classical + post-quantum).
+//! - `lattice` — ML-KEM / ML-DSA are lattice-based.
+//!
+//! | Operation       | Classical | Post-quantum |
+//! |-----------------|-----------|--------------|
+//! | KEM / encrypt   | X25519    | ML-KEM-768   |
+//! | Signature       | Ed25519   | ML-DSA-65    |
+//! | KDF             | HKDF-SHA3-256        |
+//! | AEAD            | ChaCha20-Poly1305    |
+//!
+//! ## What this crate gives you (and what it doesn't)
+//!
+//! bilattice is a thin primitive layer. It hands you four building blocks:
+//!
+//! - [`generate_keypair`] — one identity = one encryption keypair + one signing
+//!   keypair.
+//! - [`encrypt_1_to_1`] / [`decrypt_1_to_1`] — confidentiality for a single
+//!   message to a single recipient.
+//! - [`sign`] / [`verify`] — authenticity for a blob of bytes.
+//!
+//! It deliberately does **not** provide:
+//!
+//! - **Sessions / ratcheting.** Every [`encrypt_1_to_1`] call is a fresh,
+//!   independent "sealed envelope": a new ephemeral X25519 key and a new ML-KEM
+//!   encapsulation per message. There is no forward-secret session state here.
+//!   That is the job of the MLS layer that will sit on top.
+//! - **Identity binding.** Encryption and signing are separate operations on
+//!   separate keys (see below). bilattice never automatically signs what it
+//!   encrypts. Your app decides how to combine them.
+//! - **Group / 1-to-many messaging.** Only 1-to-1 is implemented today. The plan
+//!   for groups is to adopt the standardized TreeKEM construction from `openmls`,
+//!   pending hybrid post-quantum support that `openmls` does not yet provide.
+//!
+//! ## Combining encryption and signatures
+//!
+//! [`encrypt_1_to_1`] gives confidentiality and integrity of the ciphertext,
+//! but it does **not** authenticate the *sender* — the recipient's public key
+//! is enough to produce a valid ciphertext, so anyone could craft one. To prove
+//! who sent a message, combine the two primitives. The recommended order for a
+//! messaging app is **sign-then-encrypt**:
+//!
+//! ```no_run
+//! # use bilattice::*;
+//! # fn demo() -> anyhow::Result<()> {
+//! let (enc_recipient, _) = generate_keypair()?;     // recipient's public keys
+//! let (_, sig_sender) = generate_keypair()?;        // sender's signing keys
+//!
+//! // 1. sender signs the plaintext with their own signing key
+//! let signed = sign(b"hello".to_vec(), &sig_sender.kp_sec)?;
+//! // 2. serialize the signed blob, then encrypt it to the recipient
+//! let bytes = bincode_or_serde(&signed);            // your serializer of choice
+//! let envelope = encrypt_1_to_1(bytes, &enc_recipient.kp_pub)?;
+//! # let _ = envelope; Ok(())
+//! # }
+//! # fn bincode_or_serde(_: &SignedContent) -> Vec<u8> { Vec::new() }
+//! ```
+//!
+//! Sign-then-encrypt keeps the signature *inside* the encrypted envelope, so the
+//! transport server (which must never see plaintext) also never sees who signed
+//! what.
+//!
+//! ## Serialization & wire format
+//!
+//! Every public type derives [`serde::Serialize`] / [`serde::Deserialize`], so
+//! you can move keys, signed blobs and [`EncryptedMessage`]s straight onto the
+//! wire or into Postgres with whatever serde-compatible codec you prefer.
+//! [`EncryptedMessage`] carries an explicit [`ENCRYPTED_MESSAGE_VERSION`] byte;
+//! [`decrypt_1_to_1`] rejects anything it doesn't recognize, so the format can
+//! evolve without silently misinterpreting old ciphertexts.
+
 use anyhow::Result;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -18,20 +94,47 @@ use zeroize::Zeroizing;
 
 const DSA_ALGORITHM: sig::Algorithm = sig::Algorithm::MlDsa65;
 const KEM_ALGORITHM: kem::Algorithm = kem::Algorithm::MlKem768;
+
+/// Wire-format version stamped into every [`EncryptedMessage`].
+///
+/// [`decrypt_1_to_1`] refuses any message whose `version` differs, so bumping
+/// this constant is how the on-the-wire format evolves without old and new
+/// clients silently misreading each other.
 pub const ENCRYPTED_MESSAGE_VERSION: u8 = 1;
 
+const HKDF_SALT: &[u8] = b"Facet's bilattice v1 lib";
+const MESSAGE_DIRECTION: &[u8] = b"1to1 message sender->recipient";
+const AEAD_INFO_LABEL: &[u8] = b"chacha20poly1305 key";
+const AEAD_KEY_LEN: usize = 32;
+const AEAD_NONCE_LEN: usize = 12;
+const KDF_OUTPUT_LEN: usize = AEAD_KEY_LEN + AEAD_NONCE_LEN;
+
+/// A hybrid keypair used to **receive** encrypted messages.
+///
+/// Bundles both halves (public + secret) of the X25519 and ML-KEM-768 keys.
+/// Hand the [`kp_pub`](Self::kp_pub) to senders (publish it on your identity
+/// server); keep the whole struct private to decrypt with
+/// [`decrypt_1_to_1`].
 #[derive(Serialize, Deserialize)]
 pub struct EncryptionKeypair {
     pub kp_pub: EncryptionKeypairPublic,
     pub kp_sec: EncryptionKeypairSecret,
 }
 
+/// Public encryption keys for one identity — this is what a sender needs.
+///
+/// Safe to publish. Pass a reference to [`encrypt_1_to_1`] to seal a message
+/// that only the matching [`EncryptionKeypairSecret`] can open.
 #[derive(Serialize, Deserialize)]
 pub struct EncryptionKeypairPublic {
     pub kyber: KyberPub,
     pub x25519: X25519Pub,
 }
 
+/// Secret encryption keys for one identity — **never leaves the device**.
+///
+/// Required to [`decrypt_1_to_1`]. Treat as highly sensitive; do not log,
+/// serialize to the server, or transmit.
 #[derive(Serialize, Deserialize)]
 pub struct EncryptionKeypairSecret {
     pub kyber: KyberSec,
@@ -40,18 +143,28 @@ pub struct EncryptionKeypairSecret {
 
 // ------
 
+/// A hybrid keypair used to **sign** messages and prove sender identity.
+///
+/// Bundles both halves of the Ed25519 and ML-DSA-65 keys. Distinct from
+/// [`EncryptionKeypair`]: encryption and signing use separate keys, and
+/// [`generate_keypair`] mints both at once for a single identity.
 #[derive(Serialize, Deserialize)]
 pub struct SignKeypair {
     pub kp_pub: SignKeypairPublic,
     pub kp_sec: SignKeypairSecret,
 }
 
+/// Public signing keys for one identity — publish these so others can
+/// [`verify`] your signatures.
 #[derive(Serialize, Deserialize)]
 pub struct SignKeypairPublic {
     pub dilithium: DilithiumPub,
     pub ed25519: Ed25519Pub,
 }
 
+/// Secret signing keys for one identity — **never leaves the device**.
+///
+/// Required to [`sign`]. Treat as highly sensitive.
 #[derive(Serialize, Deserialize)]
 pub struct SignKeypairSecret {
     pub dilithium: DilithiumSec,
@@ -60,6 +173,13 @@ pub struct SignKeypairSecret {
 
 // ---
 
+/// A blob plus its two parallel signatures, the output of [`sign`].
+///
+/// Holds the original `content` alongside an Ed25519 and an ML-DSA-65
+/// signature over those exact bytes. Pass it to [`verify`], which requires
+/// **both** signatures to validate. Serializable, so you can ship the whole
+/// thing over the wire (or, for sign-then-encrypt, feed it into
+/// [`encrypt_1_to_1`]).
 #[derive(Serialize, Deserialize)]
 pub struct SignedContent {
     pub content: Vec<u8>,
@@ -67,6 +187,21 @@ pub struct SignedContent {
     pub ed25519_sign: ed25519_dalek::Signature,
 }
 
+/// A sealed 1-to-1 message: the output of [`encrypt_1_to_1`], the input to
+/// [`decrypt_1_to_1`].
+///
+/// Self-contained — everything the recipient needs to reconstruct the AEAD key
+/// travels with it:
+///
+/// - `version` — wire format, checked against [`ENCRYPTED_MESSAGE_VERSION`].
+/// - `x25519_ephemeral_pub` — the per-message ephemeral public key (the classical
+///   half of the KEM).
+/// - `ml_kem_ciphertext` — the ML-KEM-768 encapsulation (the post-quantum half).
+/// - `ciphertext` — the ChaCha20-Poly1305 sealed payload.
+///
+/// The AEAD nonce is *derived*, not stored, so it is not a public field. Safe to
+/// hand to an untrusted transport server: it reveals neither plaintext nor
+/// sender identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedMessage {
     pub version: u8,
@@ -76,12 +211,104 @@ pub struct EncryptedMessage {
     pub ciphertext: Vec<u8>,
 }
 
+/// Per-algorithm failure detail returned by [`verify`].
+///
+/// Each field is `Some(reason)` when that algorithm's check failed, `None` when
+/// it passed. A whole `LayerErrors` is only produced when at least one layer
+/// failed — verification succeeds only when **both** are `None`. Inspect the
+/// fields to tell apart "the post-quantum signature is bad" from "the classical
+/// one is".
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LayerErrors {
     pub dilithium: Option<String>,
     pub ed25519: Option<String>,
 }
 
+fn hybrid_ikm(x25519_ss: &[u8; 32], ml_kem_ss: &[u8]) -> Result<Zeroizing<[u8; 64]>> {
+    if ml_kem_ss.len() != 32 {
+        anyhow::bail!(
+            "unexpected ML-KEM shared secret length: {}",
+            ml_kem_ss.len()
+        );
+    }
+
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(x25519_ss);
+    ikm[32..].copy_from_slice(ml_kem_ss);
+    Ok(ikm)
+}
+
+fn transcript_hash(
+    x25519_ephemeral_pub: &X25519Pub,
+    recipient: &EncryptionKeypairPublic,
+    ml_kem_ciphertext: &[u8],
+) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+
+    h.update(b"facet-bilattice-v1 transcript");
+    h.update(b"alg:x25519+ml-kem+hkdf-sha3-256+chacha20poly1305");
+
+    h.update(b"x25519_ephemeral_pub");
+    h.update(x25519_ephemeral_pub.as_bytes());
+
+    h.update(b"recipient_x25519_pub");
+    h.update(recipient.x25519.as_bytes());
+
+    h.update(b"recipient_kyber_pub");
+    h.update(recipient.kyber.as_ref());
+
+    h.update(b"kyber_ciphertext");
+    h.update(ml_kem_ciphertext);
+
+    h.finalize().into()
+}
+
+fn derive_aead_key_material(
+    ikm: &[u8],
+    transcript_hash: &[u8; 32],
+) -> Result<Zeroizing<[u8; KDF_OUTPUT_LEN]>> {
+    let hk = Hkdf::<Sha3_256>::new(Some(HKDF_SALT), ikm);
+
+    let mut info = Vec::new();
+    info.extend_from_slice(AEAD_INFO_LABEL);
+    info.extend_from_slice(b"\0");
+    info.extend_from_slice(transcript_hash);
+    info.extend_from_slice(b"\0");
+    info.extend_from_slice(MESSAGE_DIRECTION);
+
+    let mut out = Zeroizing::new([0u8; KDF_OUTPUT_LEN]);
+    hk.expand(&info, &mut out[..])
+        .map_err(|err| anyhow::anyhow!("HKDF-SHA3 expand failed: {}", err))?;
+    Ok(out)
+}
+
+fn chacha20poly1305_from_key(key: &[u8]) -> Result<ChaCha20Poly1305> {
+    ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))
+}
+
+/// Mint a fresh identity: one [`EncryptionKeypair`] and one [`SignKeypair`].
+///
+/// A messaging app calls this once per device/identity at registration. The two
+/// keypairs are independent — encryption uses X25519 + ML-KEM-768, signing uses
+/// Ed25519 + ML-DSA-65 — but they belong to the same logical identity, so they
+/// are generated together. Publish both *public* halves
+/// ([`EncryptionKeypairPublic`], [`SignKeypairPublic`]) to your identity server;
+/// keep the secret halves on the device.
+///
+/// Randomness comes from the OS CSPRNG ([`OsRng`]).
+///
+/// ```no_run
+/// # use bilattice::generate_keypair;
+/// let (encryption, signing) = generate_keypair()?;
+/// // share these:
+/// let _enc_pub = &encryption.kp_pub;
+/// let _sig_pub = &signing.kp_pub;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+///
+/// # Errors
+/// Returns an error if the underlying liboqs KEM/signature initialization fails.
 pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
     oqs::init();
 
@@ -123,6 +350,18 @@ pub fn generate_keypair() -> Result<(EncryptionKeypair, SignKeypair)> {
     ))
 }
 
+/// Sign `content` with both halves of the sender's signing key.
+///
+/// Produces a [`SignedContent`] holding the original bytes plus an Ed25519 and
+/// an ML-DSA-65 signature over them. Use this to prove *who* sent a message;
+/// pair it with [`verify`] on the receiving side. For a messaging app, the usual
+/// flow is sign-then-encrypt: sign the plaintext, serialize the
+/// [`SignedContent`], then [`encrypt_1_to_1`] the result so the signature stays
+/// hidden from the transport server.
+///
+/// # Errors
+/// Returns an error if liboqs fails to initialize or to produce the ML-DSA
+/// signature.
 pub fn sign(content: Vec<u8>, sender: &SignKeypairSecret) -> Result<SignedContent> {
     oqs::init();
     let array_content = &content.clone();
@@ -133,6 +372,32 @@ pub fn sign(content: Vec<u8>, sender: &SignKeypairSecret) -> Result<SignedConten
     })
 }
 
+/// Verify a [`SignedContent`] against the sender's public signing keys.
+///
+/// **Both** signatures must validate (logical AND): if either the Ed25519 or the
+/// ML-DSA-65 check fails, the whole verification fails. This is what makes the
+/// scheme hybrid-secure — a forgery has to break *both* algorithms at once.
+///
+/// Returns `Ok(())` only when both layers pass. On any failure it returns a
+/// [`LayerErrors`] whose fields tell you exactly which layer(s) rejected the
+/// signature and why.
+///
+/// ```no_run
+/// # use bilattice::{generate_keypair, sign, verify};
+/// # fn demo() -> anyhow::Result<()> {
+/// let (_, signing) = generate_keypair()?;
+/// let signed = sign(b"hi".to_vec(), &signing.kp_sec)?;
+/// match verify(&signed, &signing.kp_pub) {
+///     Ok(()) => { /* authentic */ }
+///     Err(layers) => {
+///         eprintln!("dilithium: {:?}, ed25519: {:?}", layers.dilithium, layers.ed25519);
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// The Ed25519 check uses `verify_strict` to reject malleable / non-canonical
+/// signatures.
 pub fn verify(
     sigcontent: &SignedContent,
     sender: &SignKeypairPublic,
@@ -166,14 +431,44 @@ pub fn verify(
     }
 }
 
+/// Seal `content` for a single recipient, identified by their public
+/// encryption keys.
+///
+/// Each call is a standalone "sealed envelope": it generates a fresh ephemeral
+/// X25519 key and a fresh ML-KEM-768 encapsulation, derives the two shared
+/// secrets, combines them with HKDF-SHA3-256, and encrypts with
+/// ChaCha20-Poly1305. Because both KEMs contribute to the key, an attacker must
+/// break *both* X25519 and ML-KEM to recover the plaintext.
+///
+/// The result is a self-contained [`EncryptedMessage`] safe to store on or relay
+/// through an untrusted server — it leaks neither the plaintext nor the sender.
+///
+/// ## What this does and doesn't guarantee
+///
+/// - **Confidentiality + integrity** of the payload: yes, only the holder of the
+///   matching [`EncryptionKeypairSecret`] can decrypt, and tampering is detected.
+/// - **Sender authentication**: *no*. Anyone with the recipient's public key can
+///   produce a valid envelope. If the recipient must know who sent it, [`sign`]
+///   the plaintext first and encrypt the [`SignedContent`] (sign-then-encrypt).
+/// - **Forward secrecy across messages**: not provided here. Each message is
+///   independent; ratcheting belongs to the session layer above.
+///
+/// ```no_run
+/// # use bilattice::{generate_keypair, encrypt_1_to_1};
+/// # fn demo() -> anyhow::Result<()> {
+/// let (recipient, _) = generate_keypair()?;
+/// let envelope = encrypt_1_to_1(b"hello".to_vec(), &recipient.kp_pub)?;
+/// # let _ = envelope; Ok(()) }
+/// ```
+///
+/// # Errors
+/// Returns an error if ML-KEM encapsulation, HKDF expansion, or AEAD encryption
+/// fails.
 pub fn encrypt_1_to_1(
     content: Vec<u8>,
     recipient: &EncryptionKeypairPublic,
 ) -> Result<EncryptedMessage> {
     oqs::init();
-    let salt = b"Facet's bilattice v1 lib";
-    let direction = b"1to1 message sender->recipient";
-    let mut ikm = Zeroizing::new([0u8; 64]);
 
     let (kyber_ct, kyber_ss) = kem::Kem::new(KEM_ALGORITHM)?
         .encapsulate(&recipient.kyber)
@@ -182,48 +477,12 @@ pub fn encrypt_1_to_1(
     let x25519_ephemeral_pub = X25519Pub::from(&x25519_ephemeral);
     let x25519_ss = x25519_ephemeral.diffie_hellman(&recipient.x25519);
 
-    ikm[..32].copy_from_slice(x25519_ss.as_bytes());
-    ikm[32..].copy_from_slice(kyber_ss.as_ref());
-
-    let transcript_hash = {
-        let mut h = Sha3_256::new();
-
-        h.update(b"facet-bilattice-v1 transcript");
-        h.update(b"alg:x25519+ml-kem+hkdf-sha3-256+chacha20poly1305");
-
-        h.update(b"x25519_ephemeral_pub");
-        h.update(x25519_ephemeral_pub.as_bytes());
-
-        h.update(b"recipient_x25519_pub");
-        h.update(recipient.x25519.as_bytes());
-
-        h.update(b"recipient_kyber_pub");
-        h.update(recipient.kyber.as_ref());
-
-        h.update(b"kyber_ciphertext");
-        h.update(kyber_ct.as_ref());
-
-        let out: [u8; 32] = h.finalize().into();
-        out
-    };
-
-    let hk = Hkdf::<Sha3_256>::new(Some(salt), &ikm[..]);
-
-    let mut info = Vec::new();
-    info.extend_from_slice(b"chacha20poly1305 key");
-    info.extend_from_slice(b"\0");
-    info.extend_from_slice(&transcript_hash);
-    info.extend_from_slice(b"\0");
-    info.extend_from_slice(direction);
-
-    // 32 bytes key + 12 bytes nonce
-    let mut out = Zeroizing::new([0u8; 44]);
-    hk.expand(&info, &mut out[..])
-        .map_err(|err| anyhow::anyhow!("HKDF-SHA3 expand failed: {}", err))?;
-    let key = &out[..32];
-    let nonce_bytes = &out[32..44];
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))?;
+    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_ref())?;
+    let transcript_hash = transcript_hash(&x25519_ephemeral_pub, recipient, kyber_ct.as_ref());
+    let out = derive_aead_key_material(&ikm[..], &transcript_hash)?;
+    let key = &out[..AEAD_KEY_LEN];
+    let nonce_bytes = &out[AEAD_KEY_LEN..];
+    let cipher = chacha20poly1305_from_key(key)?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let ciphertext = cipher
         .encrypt(&nonce, content.as_ref())
@@ -238,6 +497,33 @@ pub fn encrypt_1_to_1(
     })
 }
 
+/// Open an [`EncryptedMessage`] sealed by [`encrypt_1_to_1`], recovering the
+/// plaintext.
+///
+/// Needs the recipient's full [`EncryptionKeypair`] (both secret and public
+/// halves — the public keys feed the transcript hash that binds the derived
+/// key). Reconstructs the hybrid shared secret by decapsulating the ML-KEM
+/// ciphertext and running X25519 against the embedded ephemeral key, then
+/// re-derives the AEAD key and nonce and decrypts.
+///
+/// As defense in depth, it first rejects messages whose `version` differs from
+/// [`ENCRYPTED_MESSAGE_VERSION`], and verifies that the stored nonce matches the
+/// one freshly derived from the transcript before attempting decryption.
+///
+/// ```no_run
+/// # use bilattice::{generate_keypair, encrypt_1_to_1, decrypt_1_to_1};
+/// # fn demo() -> anyhow::Result<()> {
+/// let (recipient, _) = generate_keypair()?;
+/// let envelope = encrypt_1_to_1(b"hello".to_vec(), &recipient.kp_pub)?;
+/// let plaintext = decrypt_1_to_1(envelope, &recipient)?;
+/// assert_eq!(plaintext, b"hello");
+/// # Ok(()) }
+/// ```
+///
+/// # Errors
+/// Returns an error if the version is unsupported, the derived nonce doesn't
+/// match, ML-KEM decapsulation fails, or AEAD authentication/decryption fails
+/// (e.g. the message was tampered with or sealed for a different recipient).
 pub fn decrypt_1_to_1(
     encrypted_content: EncryptedMessage,
     recipient: &EncryptionKeypair,
@@ -250,10 +536,6 @@ pub fn decrypt_1_to_1(
         );
     }
 
-    let salt = b"Facet's bilattice v1 lib";
-    let direction = b"1to1 message sender->recipient";
-    let mut ikm = Zeroizing::new([0u8; 64]);
-
     let kyber_ss = kem::Kem::new(KEM_ALGORITHM)?.decapsulate(
         &recipient.kp_sec.kyber,
         &encrypted_content.ml_kem_ciphertext,
@@ -263,51 +545,20 @@ pub fn decrypt_1_to_1(
         .x25519
         .diffie_hellman(&encrypted_content.x25519_ephemeral_pub);
 
-    ikm[..32].copy_from_slice(x25519_ss.as_bytes());
-    ikm[32..].copy_from_slice(kyber_ss.as_ref());
-
-    let transcript_hash = {
-        let mut h = Sha3_256::new();
-
-        h.update(b"facet-bilattice-v1 transcript");
-        h.update(b"alg:x25519+ml-kem+hkdf-sha3-256+chacha20poly1305");
-
-        h.update(b"x25519_ephemeral_pub");
-        h.update(encrypted_content.x25519_ephemeral_pub.as_bytes());
-
-        h.update(b"recipient_x25519_pub");
-        h.update(recipient.kp_pub.x25519.as_bytes());
-
-        h.update(b"recipient_kyber_pub");
-        h.update(recipient.kp_pub.kyber.as_ref());
-
-        h.update(b"kyber_ciphertext");
-        h.update(encrypted_content.ml_kem_ciphertext.as_ref());
-
-        let out: [u8; 32] = h.finalize().into();
-        out
-    };
-
-    let hk = Hkdf::<Sha3_256>::new(Some(salt), &ikm[..]);
-
-    let mut info = Vec::new();
-    info.extend_from_slice(b"chacha20poly1305 key");
-    info.extend_from_slice(b"\0");
-    info.extend_from_slice(&transcript_hash);
-    info.extend_from_slice(b"\0");
-    info.extend_from_slice(direction);
-
-    let mut out = Zeroizing::new([0u8; 44]);
-    hk.expand(&info, &mut out[..])
-        .map_err(|err| anyhow::anyhow!("HKDF-SHA3 expand failed: {}", err))?;
-    let key = &out[..32];
-    let nonce_bytes = &out[32..44];
+    let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_ref())?;
+    let transcript_hash = transcript_hash(
+        &encrypted_content.x25519_ephemeral_pub,
+        &recipient.kp_pub,
+        encrypted_content.ml_kem_ciphertext.as_ref(),
+    );
+    let out = derive_aead_key_material(&ikm[..], &transcript_hash)?;
+    let key = &out[..AEAD_KEY_LEN];
+    let nonce_bytes = &out[AEAD_KEY_LEN..];
     if encrypted_content.poly1305_nonce.as_slice() != nonce_bytes {
         anyhow::bail!("encrypted message nonce does not match derived nonce");
     }
 
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))?;
+    let cipher = chacha20poly1305_from_key(key)?;
     let nonce = Nonce::from_slice(nonce_bytes);
     Ok(cipher
         .decrypt(nonce, encrypted_content.ciphertext.as_slice())
