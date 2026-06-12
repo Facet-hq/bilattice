@@ -1,0 +1,38 @@
+name: SonarQube Cloud
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  sonar:
+    name: Analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Historia completa: Sonar la necesita para asignar autoría
+          # y detectar "new code" correctamente.
+          fetch-depth: 0
+
+      # El scanner de Sonar ejecuta `cargo clippy` por su cuenta,
+      # así que cargo y clippy tienen que estar en el PATH.
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup component add clippy llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: SonarQube Cloud scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
