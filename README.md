@@ -13,8 +13,9 @@ so a break in one still leaves the other standing.
 | Signature     | Ed25519   | ML-DSA-65    | both must verify (AND) |
 
 > This crate is a standalone primitive layer. It is **not** `facet-core`, and it
-> is not tied to Facet — it could back any messaging app. The MLS + federation
-> layers will be built on top of it later.
+> is not tied to Facet — it could back any messaging app. The optional `mls`
+> feature adds the first OpenMLS group-transport helpers; federation still lives
+> above this crate.
 
 ## Scope
 
@@ -26,22 +27,20 @@ bilattice gives you four building blocks and nothing more:
 | `encrypt_1_to_1()`     | seal a message for one recipient |
 | `decrypt_1_to_1()`     | open a sealed message |
 | `sign()` / `verify()`  | prove / check who authored a blob |
+| `mls` feature          | wrap `SignedContent` in OpenMLS application messages |
 
 It deliberately does **not** provide:
 
 - **Sessions or ratcheting.** Each `encrypt_1_to_1` is an independent sealed
   envelope (fresh ephemeral X25519 key + fresh ML-KEM encapsulation per
-  message). There is no forward-secret session state — that's the MLS layer's
-  job.
+  message). Group session state is delegated to OpenMLS behind the optional
+  `mls` feature.
 - **Automatic sender authentication.** Encryption and signing are separate
   operations on separate keys. Encrypting does not sign. See
   [Putting it together](#putting-it-together).
-- **Group / 1-to-many messaging.** Only 1-to-1 is implemented today; the API is
-  named `_1_to_1` precisely so a future `_1_to_many` can sit beside it. The plan
-  for groups is to adopt the standardized **TreeKEM** construction from
-  [`openmls`](https://github.com/openmls/openmls) rather than grow a bespoke
-  scheme here — pending hybrid post-quantum support, which `openmls` does not yet
-  provide.
+- **Delivery Service or federation.** The server still only stores and relays
+  opaque bytes. Group membership policy, queues, federation and durable MLS
+  state belong above this primitive crate.
 
 ## Integration in a messaging app
 
@@ -101,6 +100,31 @@ match verify(&signed, &sender_sig_pub) {
 
 `verify` requires **both** signatures to pass; a failure reports per-algorithm
 detail via `LayerErrors`.
+
+### 4. Group messages — sign then MLS encrypt
+
+With `--features mls`, group transport uses OpenMLS with the libcrux provider
+and the X-Wing ciphersuite `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519`
+(`0x004D`). Application messages remain bilattice payloads:
+
+```rust,no_run
+use bilattice::mls;
+
+let outbound = mls::create_signed_application_message(
+    &mut group,
+    &provider,
+    &signing.kp_sec, // MLS Ed25519 protocol signature
+    &signing.kp_sec, // bilattice Ed25519 + ML-DSA content signature
+    plaintext,
+)?;
+
+let bytes = mls::serialize_message(&outbound)?;
+// relay `bytes` through the Delivery Service unchanged.
+```
+
+On receive, `mls::process_signed_application_message` decrypts via MLS,
+deserializes `SignedContent` with `postcard`, and then calls `verify`, so both
+Ed25519 and ML-DSA-65 must pass before the plaintext is trusted.
 
 ### Putting it together
 
@@ -186,6 +210,19 @@ Hybrid: ML-DSA-65 (NIST FIPS 204) + Ed25519, signed in parallel. `verify`
 requires **both** to pass (AND, not OR), and the Ed25519 side uses
 `verify_strict` to reject malleable / non-canonical signatures.
 
+### MLS group transport
+
+The optional `mls` feature fixes Facet's group transport to OpenMLS + libcrux
+with X-Wing `0x004D`: ML-KEM-768 + X25519 for HPKE, ChaCha20-Poly1305 for AEAD,
+HKDF-SHA256, and Ed25519 for the mandatory MLS protocol signatures. `0x004D` is
+still a draft ciphersuite code point, so a future OpenMLS/IETF update could
+require a wire-format migration. bilattice's hybrid `SignedContent` sits inside
+the encrypted MLS application message.
+
+The ratchet tree extension is enabled in the default group config so Welcome
+messages are self-contained for the client. The Delivery Service still does not
+decrypt or inspect them.
+
 ## Status
 
 | Function          | State |
@@ -195,7 +232,8 @@ requires **both** to pass (AND, not OR), and the Ed25519 side uses
 | `decrypt_1_to_1`  | V |
 | `sign`            | V |
 | `verify`          | V |
-| 1-to-many (groups)| planned (standardized TreeKEM via `openmls`, once it supports hybrid PQ) |
+| MLS group transport | V initial helper API behind `--features mls` |
 
 Run `cargo doc -p bilattice --open` for the full API reference, or
-`cargo test -p bilattice` for the round-trip tests.
+`cargo test -p bilattice` for primitive tests. Run
+`cargo test -p bilattice --features mls` for the OpenMLS round-trip test.

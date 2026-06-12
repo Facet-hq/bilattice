@@ -26,16 +26,17 @@
 //!
 //! It deliberately does **not** provide:
 //!
-//! - **Sessions / ratcheting.** Every [`encrypt_1_to_1`] call is a fresh,
+//! - **1-to-1 sessions / ratcheting.** Every [`encrypt_1_to_1`] call is a fresh,
 //!   independent "sealed envelope": a new ephemeral X25519 key and a new ML-KEM
 //!   encapsulation per message. There is no forward-secret session state here.
-//!   That is the job of the MLS layer that will sit on top.
+//!   Group session state belongs to the optional `mls` feature, which wraps
+//!   OpenMLS.
 //! - **Identity binding.** Encryption and signing are separate operations on
 //!   separate keys (see below). bilattice never automatically signs what it
 //!   encrypts. Your app decides how to combine them.
-//! - **Group / 1-to-many messaging.** Only 1-to-1 is implemented today. The plan
-//!   for groups is to adopt the standardized TreeKEM construction from `openmls`,
-//!   pending hybrid post-quantum support that `openmls` does not yet provide.
+//! - **A Delivery Service / federation.** With the `mls` feature, bilattice can
+//!   create and process OpenMLS application messages carrying [`SignedContent`].
+//!   The server side still just stores and relays opaque MLS bytes.
 //!
 //! ## Combining encryption and signatures
 //!
@@ -92,6 +93,9 @@ use x25519_dalek::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(feature = "mls")]
+pub mod mls;
+
 const DSA_ALGORITHM: sig::Algorithm = sig::Algorithm::MlDsa65;
 const KEM_ALGORITHM: kem::Algorithm = kem::Algorithm::MlKem768;
 
@@ -101,6 +105,12 @@ const KEM_ALGORITHM: kem::Algorithm = kem::Algorithm::MlKem768;
 /// this constant is how the on-the-wire format evolves without old and new
 /// clients silently misreading each other.
 pub const ENCRYPTED_MESSAGE_VERSION: u8 = 1;
+
+/// Number of bytes in a public-key fingerprint.
+pub const KEY_FINGERPRINT_LEN: usize = 32;
+
+/// SHA3-256 fingerprint of a public keypair.
+pub type KeyFingerprint = [u8; KEY_FINGERPRINT_LEN];
 
 const HKDF_SALT: &[u8] = b"Facet's bilattice v1 lib";
 const MESSAGE_DIRECTION: &[u8] = b"1to1 message sender->recipient";
@@ -129,6 +139,24 @@ pub struct EncryptionKeypair {
 pub struct EncryptionKeypairPublic {
     pub kyber: KyberPub,
     pub x25519: X25519Pub,
+}
+
+impl EncryptionKeypairPublic {
+    /// Return a stable SHA3-256 fingerprint for these public encryption keys.
+    pub fn fingerprint(&self) -> KeyFingerprint {
+        let mut h = Sha3_256::new();
+        h.update(b"facet-bilattice-v1 encryption-public-key fingerprint");
+        h.update(b"x25519");
+        h.update(self.x25519.as_bytes());
+        h.update(b"ml-kem-768");
+        h.update(self.kyber.as_ref());
+        h.finalize().into()
+    }
+
+    /// Return the public encryption key fingerprint as lowercase hex.
+    pub fn fingerprint_hex(&self) -> String {
+        hex_encode(&self.fingerprint())
+    }
 }
 
 /// Secret encryption keys for one identity — **never leaves the device**.
@@ -160,6 +188,24 @@ pub struct SignKeypair {
 pub struct SignKeypairPublic {
     pub dilithium: DilithiumPub,
     pub ed25519: Ed25519Pub,
+}
+
+impl SignKeypairPublic {
+    /// Return a stable SHA3-256 fingerprint for these public signing keys.
+    pub fn fingerprint(&self) -> KeyFingerprint {
+        let mut h = Sha3_256::new();
+        h.update(b"facet-bilattice-v1 signing-public-key fingerprint");
+        h.update(b"ed25519");
+        h.update(self.ed25519.as_bytes());
+        h.update(b"ml-dsa-65");
+        h.update(self.dilithium.as_ref());
+        h.finalize().into()
+    }
+
+    /// Return the public signing key fingerprint as lowercase hex.
+    pub fn fingerprint_hex(&self) -> String {
+        hex_encode(&self.fingerprint())
+    }
 }
 
 /// Secret signing keys for one identity — **never leaves the device**.
@@ -285,6 +331,17 @@ fn derive_aead_key_material(
 fn chacha20poly1305_from_key(key: &[u8]) -> Result<ChaCha20Poly1305> {
     ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| anyhow::anyhow!("invalid ChaCha20Poly1305 key length"))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Mint a fresh identity: one [`EncryptionKeypair`] and one [`SignKeypair`].
