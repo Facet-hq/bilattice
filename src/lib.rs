@@ -7,12 +7,10 @@
 //! - `bi` — two algorithms per operation (classical + post-quantum).
 //! - `lattice` — ML-KEM / ML-DSA are lattice-based.
 //!
-//! | Operation       | Classical | Post-quantum |
-//! |-----------------|-----------|--------------|
-//! | KEM / encrypt   | X25519    | ML-KEM-768   |
-//! | Signature       | Ed25519   | ML-DSA-65    |
-//! | KDF             | HKDF-SHA3-256        |
-//! | AEAD            | ChaCha20-Poly1305    |
+//! | Operation     | Classical | Post-quantum | Combiner / AEAD                    |
+//! |---------------|-----------|--------------|-----------------------------------|
+//! | KEM / encrypt | X25519    | ML-KEM-768   | HKDF-SHA3-256 → ChaCha20-Poly1305 |
+//! | Signature     | Ed25519   | ML-DSA-65    | both must verify (AND)            |
 //!
 //! ## What this crate gives you (and what it doesn't)
 //!
@@ -24,6 +22,9 @@
 //! - [`encrypt_1_to_1`] / [`decrypt_1_to_1`] — confidentiality for a single
 //!   message to a single recipient.
 //! - [`sign`] / [`verify`] — authenticity for a blob of bytes.
+//! - `validate` / `fingerprint` on the public-key bundles — sanity-check a key
+//!   received from an untrusted source, and derive a stable SHA3-256 fingerprint
+//!   for out-of-band verification.
 //!
 //! It deliberately does **not** provide:
 //!
@@ -116,6 +117,9 @@ const ML_DSA_CONTENT_SIGNATURE_CONTEXT: &[u8] = b"facet-bilattice-v1 ml-dsa-65 c
 const AEAD_KEY_LEN: usize = 32;
 const AEAD_NONCE_LEN: usize = 12;
 const KDF_OUTPUT_LEN: usize = AEAD_KEY_LEN + AEAD_NONCE_LEN;
+// Public, fixed scalar used only to reject non-contributory X25519 inputs.
+// It is not used to derive message keys, so it does not need to be secret.
+const X25519_CONTRIBUTORY_CHECK_SCALAR: [u8; 32] = [0x42; 32];
 
 /// A hybrid keypair used to **receive** encrypted messages.
 ///
@@ -140,6 +144,30 @@ pub struct EncryptionKeypairPublic {
 }
 
 impl EncryptionKeypairPublic {
+    /// Validate this public encryption key bundle before accepting it from an
+    /// untrusted source.
+    ///
+    /// This checks the ML-KEM-768 public-key length expected by liboqs and
+    /// rejects non-contributory X25519 public keys (for example the all-zero
+    /// low-order point). It does **not** prove ownership of the matching secret
+    /// keys; bind the bundle to an identity with a signed challenge at the
+    /// protocol layer.
+    pub fn validate(&self) -> Result<()> {
+        oqs::init();
+
+        let kem_alg = kem::Kem::new(KEM_ALGORITHM)?;
+        if self.kyber.as_ref().len() != kem_alg.length_public_key() {
+            anyhow::bail!(
+                "invalid ML-KEM public key length: expected {}, got {}",
+                kem_alg.length_public_key(),
+                self.kyber.as_ref().len()
+            );
+        }
+
+        validate_x25519_public_key(&self.x25519)?;
+        Ok(())
+    }
+
     /// Return a stable SHA3-256 fingerprint for these public encryption keys.
     pub fn fingerprint(&self) -> KeyFingerprint {
         let mut h = Sha3_256::new();
@@ -189,6 +217,32 @@ pub struct SignKeypairPublic {
 }
 
 impl SignKeypairPublic {
+    /// Validate this public signing key bundle before accepting it from an
+    /// untrusted source.
+    ///
+    /// This checks the ML-DSA-65 public-key length expected by liboqs and
+    /// rejects weak / low-order Ed25519 keys. It does **not** prove ownership of
+    /// the matching secret keys; verify a signed challenge or signed key bundle
+    /// at the protocol layer.
+    pub fn validate(&self) -> Result<()> {
+        oqs::init();
+
+        let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
+        if self.dilithium.as_ref().len() != sig_alg.length_public_key() {
+            anyhow::bail!(
+                "invalid ML-DSA public key length: expected {}, got {}",
+                sig_alg.length_public_key(),
+                self.dilithium.as_ref().len()
+            );
+        }
+
+        if self.ed25519.is_weak() {
+            anyhow::bail!("weak Ed25519 public key");
+        }
+
+        Ok(())
+    }
+
     /// Return a stable SHA3-256 fingerprint for these public signing keys.
     pub fn fingerprint(&self) -> KeyFingerprint {
         let mut h = Sha3_256::new();
@@ -405,6 +459,17 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn validate_x25519_public_key(public_key: &X25519Pub) -> Result<()> {
+    let validation_scalar = X25519Sec::from(X25519_CONTRIBUTORY_CHECK_SCALAR);
+    let shared_secret = validation_scalar.diffie_hellman(public_key);
+
+    if !shared_secret.was_contributory() {
+        anyhow::bail!("non-contributory X25519 public key");
+    }
+
+    Ok(())
+}
+
 /// Mint a fresh identity: one [`EncryptionKeypair`] and one [`SignKeypair`].
 ///
 /// A messaging app calls this once per device/identity at registration. The two
@@ -561,11 +626,12 @@ pub fn verify(
 /// Seal `content` for a single recipient, identified by their public
 /// encryption keys.
 ///
-/// Each call is a standalone "sealed envelope": it generates a fresh ephemeral
-/// X25519 key and a fresh ML-KEM-768 encapsulation, derives the two shared
-/// secrets, combines them with HKDF-SHA3-256, and encrypts with
-/// ChaCha20-Poly1305. Because both KEMs contribute to the key, an attacker must
-/// break *both* X25519 and ML-KEM to recover the plaintext.
+/// Each call is a standalone "sealed envelope": it [`validate`](EncryptionKeypairPublic::validate)s
+/// the recipient's public keys, generates a fresh ephemeral X25519 key and a
+/// fresh ML-KEM-768 encapsulation, derives the two shared secrets, combines them
+/// with HKDF-SHA3-256, and encrypts with ChaCha20-Poly1305. Because both KEMs
+/// contribute to the key, an attacker must break *both* X25519 and ML-KEM to
+/// recover the plaintext.
 ///
 /// The result is a self-contained [`EncryptedMessage`] safe to store on or relay
 /// through an untrusted server — it leaks neither the plaintext nor the sender.
@@ -596,6 +662,7 @@ pub fn encrypt_1_to_1(
     recipient: &EncryptionKeypairPublic,
 ) -> Result<EncryptedMessage> {
     oqs::init();
+    recipient.validate()?;
 
     let (kyber_ct, kyber_ss) = kem::Kem::new(KEM_ALGORITHM)?
         .encapsulate(&recipient.kyber)
@@ -670,6 +737,9 @@ pub fn decrypt_1_to_1(
         .kp_sec
         .x25519
         .diffie_hellman(&encrypted_content.x25519_ephemeral_pub);
+    if !x25519_ss.was_contributory() {
+        anyhow::bail!("non-contributory X25519 ephemeral public key");
+    }
 
     let ikm = hybrid_ikm(x25519_ss.as_bytes(), kyber_ss.as_slice())?;
     let transcript_hash = transcript_hash(
@@ -686,4 +756,57 @@ pub fn decrypt_1_to_1(
     cipher
         .decrypt(nonce, encrypted_content.ciphertext.as_slice())
         .map_err(|_| anyhow::anyhow!("ChaCha20Poly1305 decryption failed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_public_key_bundles_validate() -> Result<()> {
+        let (encryption, signing) = generate_keypair()?;
+
+        encryption.kp_pub.validate()?;
+        signing.kp_pub.validate()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn signing_validation_rejects_weak_ed25519_public_key() -> Result<()> {
+        let (_, signing) = generate_keypair()?;
+        let mut weak_bytes = [0u8; 32];
+        weak_bytes[0] = 1;
+        let weak_ed25519 = Ed25519Pub::from_bytes(&weak_bytes)?;
+
+        let invalid = SignKeypairPublic {
+            dilithium: signing.kp_pub.dilithium,
+            ed25519: weak_ed25519,
+        };
+
+        assert!(invalid.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn encryption_validation_rejects_non_contributory_x25519_public_key() -> Result<()> {
+        let (encryption, _) = generate_keypair()?;
+        let invalid = EncryptionKeypairPublic {
+            kyber: encryption.kp_pub.kyber,
+            x25519: X25519Pub::from([0u8; 32]),
+        };
+
+        assert!(invalid.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decrypt_rejects_non_contributory_ephemeral_x25519_public_key() -> Result<()> {
+        let (recipient, _) = generate_keypair()?;
+        let mut envelope = encrypt_1_to_1(b"hello".to_vec(), &recipient.kp_pub)?;
+        envelope.x25519_ephemeral_pub = X25519Pub::from([0u8; 32]);
+
+        assert!(decrypt_1_to_1(envelope, &recipient).is_err());
+        Ok(())
+    }
 }

@@ -26,6 +26,8 @@ bilattice gives you these building blocks and nothing more:
 | `encrypt_1_to_1()`     | seal a message for one recipient |
 | `decrypt_1_to_1()`     | open a sealed message |
 | `sign()` / `verify()`  | prove / check who authored a blob |
+| `.validate()`          | sanity-check a public-key bundle received from an untrusted source |
+| `.fingerprint()` / `.fingerprint_hex()` | stable SHA3-256 fingerprint of a public-key bundle for out-of-band verification |
 
 It deliberately does **not** provide:
 
