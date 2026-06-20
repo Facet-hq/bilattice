@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! # bilattice
 //!
 //! Hybrid post-quantum cryptographic primitives for native secure messaging
@@ -144,6 +146,33 @@ pub struct EncryptionKeypairPublic {
 }
 
 impl EncryptionKeypairPublic {
+    /// Reconstruct public encryption keys from raw wire/storage bytes.
+    ///
+    /// This keeps algorithm selection inside bilattice: ML-KEM-768 is the only
+    /// KEM used here, via the crate's fixed algorithm constant.
+    pub fn from_bytes(kyber: &[u8], x25519: &[u8]) -> Result<Self> {
+        oqs::init();
+
+        let kem_alg = kem::Kem::new(KEM_ALGORITHM)?;
+        let kyber = kem_alg
+            .public_key_from_bytes(kyber)
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-KEM public key"))?
+            .to_owned();
+        let x25519: [u8; 32] = x25519.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid X25519 public key length: expected 32, got {}",
+                x25519.len()
+            )
+        })?;
+
+        let public = Self {
+            kyber,
+            x25519: X25519Pub::from(x25519),
+        };
+        public.validate()?;
+        Ok(public)
+    }
+
     /// Validate this public encryption key bundle before accepting it from an
     /// untrusted source.
     ///
@@ -217,6 +246,33 @@ pub struct SignKeypairPublic {
 }
 
 impl SignKeypairPublic {
+    /// Reconstruct public signing keys from raw wire/storage bytes.
+    ///
+    /// This keeps algorithm selection inside bilattice: ML-DSA-65 is the only
+    /// post-quantum signature algorithm used here, via the crate's fixed
+    /// algorithm constant.
+    pub fn from_bytes(dilithium: &[u8], ed25519: &[u8]) -> Result<Self> {
+        oqs::init();
+
+        let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
+        let dilithium = sig_alg
+            .public_key_from_bytes(dilithium)
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA public key"))?
+            .to_owned();
+        let ed25519: [u8; 32] = ed25519.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid Ed25519 public key length: expected 32, got {}",
+                ed25519.len()
+            )
+        })?;
+        let ed25519 = Ed25519Pub::from_bytes(&ed25519)
+            .map_err(|error| anyhow::anyhow!("invalid Ed25519 public key: {}", error))?;
+
+        let public = Self { dilithium, ed25519 };
+        public.validate()?;
+        Ok(public)
+    }
+
     /// Validate this public signing key bundle before accepting it from an
     /// untrusted source.
     ///
@@ -325,18 +381,125 @@ impl AsRef<[u8]> for MlDsaSecretKey {
 
 // ---
 
-/// A blob plus its two parallel signatures, the output of [`sign`].
+/// Owned ML-DSA-65 signature bytes.
 ///
-/// Holds the original `content` alongside an Ed25519 and an ML-DSA-65
-/// signature over those exact bytes. Pass it to [`verify`], which requires
-/// **both** signatures to validate. Serializable, so you can ship the whole
-/// thing over the wire (or, for sign-then-encrypt, feed it into
-/// [`encrypt_1_to_1`]).
-#[derive(Serialize, Deserialize)]
+/// This keeps `oqs` out of the public client API for signature reconstruction:
+/// clients can persist / receive raw bytes and rebuild the signature with
+/// [`MlDsaSignature::from_bytes`] instead of calling `oqs::sig` directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlDsaSignature(Vec<u8>);
+
+impl MlDsaSignature {
+    fn from_oqs(signature: sig::Signature) -> Self {
+        Self(signature.into_vec())
+    }
+
+    /// Reconstruct an ML-DSA-65 signature from raw bytes.
+    ///
+    /// This initializes liboqs and validates the byte length against the
+    /// crate's fixed ML-DSA algorithm. It does not prove authenticity; use
+    /// [`verify`] for that.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        oqs::init();
+
+        let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
+        let expected_len = sig_alg.length_signature();
+        if bytes.len() != expected_len {
+            anyhow::bail!(
+                "invalid ML-DSA signature length: expected {}, got {}",
+                expected_len,
+                bytes.len()
+            );
+        }
+
+        Ok(Self(bytes))
+    }
+
+    fn as_oqs_ref<'a>(&'a self, sig_alg: &sig::Sig) -> Result<sig::SignatureRef<'a>> {
+        let expected_len = sig_alg.length_signature();
+        if self.0.len() != expected_len {
+            anyhow::bail!(
+                "invalid ML-DSA signature length: expected {}, got {}",
+                expected_len,
+                self.0.len()
+            );
+        }
+
+        sig_alg
+            .signature_from_bytes(self.0.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA signature length"))
+    }
+
+    /// Return the raw signature bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Consume this signature and return the raw bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for MlDsaSignature {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// The two signatures that must travel and verify together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridSignature {
+    pub dilithium: MlDsaSignature,
+    pub ed25519: ed25519_dalek::Signature,
+}
+
+impl HybridSignature {
+    /// Reconstruct a hybrid signature from raw signature bytes.
+    ///
+    /// `dilithium` is ML-DSA-65/Dilithium bytes. `ed25519` must be exactly 64
+    /// bytes. Use [`verify`] afterward to authenticate content.
+    pub fn from_bytes(dilithium: Vec<u8>, ed25519: &[u8]) -> Result<Self> {
+        let ed25519: [u8; ed25519_dalek::SIGNATURE_LENGTH] = ed25519.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid Ed25519 signature length: expected {}, got {}",
+                ed25519_dalek::SIGNATURE_LENGTH,
+                ed25519.len()
+            )
+        })?;
+
+        Ok(Self {
+            dilithium: MlDsaSignature::from_bytes(dilithium)?,
+            ed25519: ed25519_dalek::Signature::from_bytes(&ed25519),
+        })
+    }
+
+    /// Build from already reconstructed per-algorithm signatures.
+    pub fn from_parts(dilithium: MlDsaSignature, ed25519: ed25519_dalek::Signature) -> Self {
+        Self { dilithium, ed25519 }
+    }
+
+    /// Return the raw ML-DSA-65 signature bytes.
+    pub fn dilithium_bytes(&self) -> &[u8] {
+        self.dilithium.as_bytes()
+    }
+
+    /// Return the raw Ed25519 signature bytes.
+    pub fn ed25519_bytes(&self) -> [u8; ed25519_dalek::SIGNATURE_LENGTH] {
+        self.ed25519.to_bytes()
+    }
+}
+
+/// A blob plus its hybrid signature, the output of [`sign`].
+///
+/// Holds the original `content` alongside an Ed25519 + ML-DSA-65 signature pair
+/// over those exact bytes. Pass it to [`verify`], which requires **both**
+/// signatures to validate. Serializable, so you can ship the whole thing over
+/// the wire (or, for sign-then-encrypt, feed it into [`encrypt_1_to_1`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedContent {
     pub content: Vec<u8>,
-    pub dilithium_sign: sig::Signature,
-    pub ed25519_sign: ed25519_dalek::Signature,
+    pub signature: HybridSignature,
 }
 
 /// A sealed 1-to-1 message: the output of [`encrypt_1_to_1`], the input to
@@ -552,12 +715,14 @@ pub fn sign(content: Vec<u8>, sender: &SignKeypairSecret) -> Result<SignedConten
     let sig_alg = sig::Sig::new(DSA_ALGORITHM)?;
     let dilithium = sender.dilithium.as_oqs_ref(&sig_alg)?;
     Ok(SignedContent {
-        dilithium_sign: sig_alg.sign_with_ctx_str(
-            &content,
-            ML_DSA_CONTENT_SIGNATURE_CONTEXT,
-            dilithium,
-        )?,
-        ed25519_sign: sender.ed25519.sign(&ed25519_message),
+        signature: HybridSignature {
+            dilithium: MlDsaSignature::from_oqs(sig_alg.sign_with_ctx_str(
+                &content,
+                ML_DSA_CONTENT_SIGNATURE_CONTEXT,
+                dilithium,
+            )?),
+            ed25519: sender.ed25519.sign(&ed25519_message),
+        },
         content,
     })
 }
@@ -594,22 +759,25 @@ pub fn verify(
 ) -> std::result::Result<(), LayerErrors> {
     oqs::init();
     let dilithium_err = match sig::Sig::new(DSA_ALGORITHM) {
-        Ok(sig_alg) => sig_alg
-            .verify_with_ctx_str(
-                &sigcontent.content,
-                &sigcontent.dilithium_sign,
-                ML_DSA_CONTENT_SIGNATURE_CONTEXT,
-                &sender.dilithium,
-            )
-            .err()
-            .map(|e| e.to_string()),
+        Ok(sig_alg) => match sigcontent.signature.dilithium.as_oqs_ref(&sig_alg) {
+            Ok(dilithium_signature) => sig_alg
+                .verify_with_ctx_str(
+                    &sigcontent.content,
+                    dilithium_signature,
+                    ML_DSA_CONTENT_SIGNATURE_CONTEXT,
+                    &sender.dilithium,
+                )
+                .err()
+                .map(|e| e.to_string()),
+            Err(err) => Some(err.to_string()),
+        },
         Err(err) => Some(err.to_string()),
     };
 
     let ed25519_message = ed25519_content_signature_message(&sigcontent.content);
     let ed25519_err = sender
         .ed25519
-        .verify_strict(&ed25519_message, &sigcontent.ed25519_sign)
+        .verify_strict(&ed25519_message, &sigcontent.signature.ed25519)
         .err()
         .map(|e| e.to_string());
 
@@ -769,6 +937,27 @@ mod tests {
         encryption.kp_pub.validate()?;
         signing.kp_pub.validate()?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn public_key_bundles_reconstruct_from_raw_bytes() -> Result<()> {
+        let (encryption, signing) = generate_keypair()?;
+
+        let rebuilt_encryption = EncryptionKeypairPublic::from_bytes(
+            encryption.kp_pub.kyber.as_ref(),
+            encryption.kp_pub.x25519.as_bytes(),
+        )?;
+        let rebuilt_signing = SignKeypairPublic::from_bytes(
+            signing.kp_pub.dilithium.as_ref(),
+            signing.kp_pub.ed25519.as_bytes(),
+        )?;
+
+        assert_eq!(
+            rebuilt_encryption.fingerprint(),
+            encryption.kp_pub.fingerprint()
+        );
+        assert_eq!(rebuilt_signing.fingerprint(), signing.kp_pub.fingerprint());
         Ok(())
     }
 
