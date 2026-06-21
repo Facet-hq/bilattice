@@ -88,7 +88,8 @@ use oqs::kem::{PublicKey as KyberPub, SecretKey as KyberSec};
 use oqs::sig;
 use oqs::sig::{PublicKey as DilithiumPub, SecretKey as DilithiumSec};
 use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Sha3_256};
 use x25519_dalek::{
     EphemeralSecret as X25519EphSec, PublicKey as X25519Pub, StaticSecret as X25519Sec,
@@ -139,7 +140,7 @@ pub struct EncryptionKeypair {
 ///
 /// Safe to publish. Pass a reference to [`encrypt_1_to_1`] to seal a message
 /// that only the matching [`EncryptionKeypairSecret`] can open.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct EncryptionKeypairPublic {
     pub kyber: KyberPub,
     pub x25519: X25519Pub,
@@ -214,6 +215,36 @@ impl EncryptionKeypairPublic {
     }
 }
 
+// Manual serde keeps the wire/storage format as compact CBOR byte strings
+// (one per key) and runs the same validation as
+// [`EncryptionKeypairPublic::from_bytes`] on deserialization. A derived
+// `Deserialize` would neither produce byte strings (the `oqs` public-key types
+// serialize as `{ bytes: [u8; N] }` arrays) nor validate, so the bundle could
+// arrive malformed/non-contributory without notice.
+impl Serialize for EncryptionKeypairPublic {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("EncryptionKeypairPublic", 2)?;
+        state.serialize_field("kyber", serde_bytes::Bytes::new(self.kyber.as_ref()))?;
+        state.serialize_field("x25519", serde_bytes::Bytes::new(self.x25519.as_bytes()))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for EncryptionKeypairPublic {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(with = "serde_bytes")]
+            kyber: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            x25519: Vec<u8>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        EncryptionKeypairPublic::from_bytes(&raw.kyber, &raw.x25519)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Secret encryption keys for one identity — **never leaves the device**.
 ///
 /// Required to [`decrypt_1_to_1`]. Treat as highly sensitive; do not log,
@@ -239,7 +270,7 @@ pub struct SignKeypair {
 
 /// Public signing keys for one identity — publish these so others can
 /// [`verify`] your signatures.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct SignKeypairPublic {
     pub dilithium: DilithiumPub,
     pub ed25519: Ed25519Pub,
@@ -313,6 +344,35 @@ impl SignKeypairPublic {
     /// Return the public signing key fingerprint as lowercase hex.
     pub fn fingerprint_hex(&self) -> String {
         hex_encode(&self.fingerprint())
+    }
+}
+
+// Manual serde keeps the wire/storage format as compact CBOR byte strings
+// (one per key) and runs the same validation as [`SignKeypairPublic::from_bytes`]
+// on deserialization. A derived `Deserialize` would neither produce byte strings
+// (the `oqs` public-key types serialize as `{ bytes: [u8; N] }` arrays) nor
+// validate, so the bundle could arrive malformed/weak without notice.
+impl Serialize for SignKeypairPublic {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("SignKeypairPublic", 2)?;
+        state.serialize_field("dilithium", serde_bytes::Bytes::new(self.dilithium.as_ref()))?;
+        state.serialize_field("ed25519", serde_bytes::Bytes::new(self.ed25519.as_bytes()))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SignKeypairPublic {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(with = "serde_bytes")]
+            dilithium: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            ed25519: Vec<u8>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        SignKeypairPublic::from_bytes(&raw.dilithium, &raw.ed25519)
+            .map_err(serde::de::Error::custom)
     }
 }
 
